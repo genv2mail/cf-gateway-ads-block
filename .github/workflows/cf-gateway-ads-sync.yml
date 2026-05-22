@@ -49,12 +49,15 @@ jobs:
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
           LIST_PREFIX: "Block ads"
           RULE_NAME: "Block ads"
           BLOCKLIST_URL: "https://small.oisd.nl/domainswild2"
+
           MAX_LIST_SIZE: "1000"
           MAX_LISTS: "100"
-          CLOUDFLARE_LIST_LIMIT: "100"
+          CLOUDFLARE_LIST_LIMIT: "1000"
           RULE_PRECEDENCE: "90"
           DELETE_EXCESS_LISTS: "1"
+          CF_API_SLEEP_SECONDS: "0.15"
         run: bash ./cf-gateway-ads-sync.sh
