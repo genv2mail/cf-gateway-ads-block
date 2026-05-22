@@ -1,423 +1,413 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
+IFS=$'\n\t'
 
-# Cloudflare Gateway Ad Block Sync
-# Required environment:
-#   CF_API_TOKEN   or CLOUDFLARE_API_TOKEN or API_TOKEN
-#   CF_ACCOUNT_ID  or CLOUDFLARE_ACCOUNT_ID or ACCOUNT_ID
-#
-# Optional environment:
-#   LIST_PREFIX="Block ads"
-#   RULE_NAME="Block ads"
-#   BLOCKLIST_URL="https://small.oisd.nl/domainswild2"
-#   MAX_LIST_SIZE=1000
-#   MAX_LISTS=100
-#   CLOUDFLARE_LIST_LIMIT=100
-#   RULE_PRECEDENCE=90
-#   DELETE_EXCESS_LISTS=1
+workdir=''
 
-CF_API_TOKEN="${CF_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-${API_TOKEN:-}}}"
-CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-${CLOUDFLARE_ACCOUNT_ID:-${ACCOUNT_ID:-}}}"
+cleanup() {
+  local status=$?
 
-LIST_PREFIX="${LIST_PREFIX:-Block ads}"
-RULE_NAME="${RULE_NAME:-Block ads}"
-BLOCKLIST_URL="${BLOCKLIST_URL:-https://small.oisd.nl/domainswild2}"
-MAX_LIST_SIZE="${MAX_LIST_SIZE:-1000}"
-MAX_LISTS="${MAX_LISTS:-100}"
-CLOUDFLARE_LIST_LIMIT="${CLOUDFLARE_LIST_LIMIT:-100}"
-RULE_PRECEDENCE="${RULE_PRECEDENCE:-90}"
-DELETE_EXCESS_LISTS="${DELETE_EXCESS_LISTS:-1}"
+  if [[ -n "${workdir:-}" && -d "${workdir}" ]]; then
+    if ! rm -rf -- "${workdir}"; then
+      printf '::warning::Failed to remove temporary workdir\n' >&2
+    fi
+  fi
 
-CF_API_BASE="https://api.cloudflare.com/client/v4"
-
-fail() {
-    printf 'ERROR: %s\n' "$1" >&2
-    exit 1
+  exit "${status}"
 }
 
-info() {
-    printf '[sync] %s\n' "$1"
+trap cleanup EXIT
+
+log() {
+  printf '[sync] %s\n' "$*"
+}
+
+fail() {
+  printf '::error::%s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf '::warning::%s\n' "$*" >&2
 }
 
 require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+  local cmd="$1"
+
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    fail "Missing required command: ${cmd}"
+  fi
 }
 
-validate_config() {
-    [[ -n "$CF_API_TOKEN" ]] || fail "Missing CF_API_TOKEN / CLOUDFLARE_API_TOKEN / API_TOKEN"
-    [[ -n "$CF_ACCOUNT_ID" ]] || fail "Missing CF_ACCOUNT_ID / CLOUDFLARE_ACCOUNT_ID / ACCOUNT_ID"
+require_env() {
+  local name="$1"
+  local value="${!name:-}"
 
-    [[ "$MAX_LIST_SIZE" =~ ^[0-9]+$ ]] || fail "MAX_LIST_SIZE must be numeric"
-    [[ "$MAX_LISTS" =~ ^[0-9]+$ ]] || fail "MAX_LISTS must be numeric"
-    [[ "$CLOUDFLARE_LIST_LIMIT" =~ ^[0-9]+$ ]] || fail "CLOUDFLARE_LIST_LIMIT must be numeric"
-    [[ "$RULE_PRECEDENCE" =~ ^[0-9]+$ ]] || fail "RULE_PRECEDENCE must be numeric"
-    [[ "$DELETE_EXCESS_LISTS" =~ ^[01]$ ]] || fail "DELETE_EXCESS_LISTS must be 0 or 1"
-
-    (( MAX_LIST_SIZE > 0 )) || fail "MAX_LIST_SIZE must be greater than zero"
-    (( MAX_LISTS > 0 )) || fail "MAX_LISTS must be greater than zero"
-    (( CLOUDFLARE_LIST_LIMIT > 0 )) || fail "CLOUDFLARE_LIST_LIMIT must be greater than zero"
+  if [[ -z "${value}" ]]; then
+    fail "Missing required environment variable: ${name}"
+  fi
 }
 
-api_request() {
-    local method="$1"
-    local path="$2"
-    local data="${3-}"
-    local response_file
-    local http_code
-    local error_text
+is_positive_int() {
+  local value="$1"
 
-    response_file="$(mktemp)"
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]]
+}
 
-    if [[ -n "$data" ]]; then
-        http_code="$(
-            curl -sS \
-                --retry 5 \
-                --retry-delay 2 \
-                --retry-all-errors \
-                -X "$method" \
-                -H "Authorization: Bearer ${CF_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                -o "$response_file" \
-                -w "%{http_code}" \
-                --data "$data" \
-                "${CF_API_BASE}${path}"
-        )"
-    else
-        http_code="$(
-            curl -sS \
-                --retry 5 \
-                --retry-delay 2 \
-                --retry-all-errors \
-                -X "$method" \
-                -H "Authorization: Bearer ${CF_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                -o "$response_file" \
-                -w "%{http_code}" \
-                "${CF_API_BASE}${path}"
-        )"
+is_non_negative_int() {
+  local value="$1"
+
+  [[ "${value}" =~ ^[0-9]+$ ]]
+}
+
+cf_api() {
+  local method="$1"
+  local path="$2"
+  local payload_file="${3:-}"
+  local response=''
+  local http_code=''
+  local body=''
+  local parsed_errors=''
+  local response_file="${workdir}/cf-response.json"
+  local url="${CF_API_BASE}${path}"
+
+  if [[ -n "${payload_file}" ]]; then
+    response="$(curl -sS \
+      --request "${method}" \
+      --connect-timeout 20 \
+      --max-time 180 \
+      --retry 3 \
+      --retry-delay 2 \
+      --retry-all-errors \
+      --header "Authorization: Bearer ${CF_API_TOKEN}" \
+      --header 'Content-Type: application/json' \
+      --data-binary "@${payload_file}" \
+      --write-out $'\n%{http_code}' \
+      "${url}")" || fail "Cloudflare API request failed: ${method} ${path}"
+  else
+    response="$(curl -sS \
+      --request "${method}" \
+      --connect-timeout 20 \
+      --max-time 180 \
+      --retry 3 \
+      --retry-delay 2 \
+      --retry-all-errors \
+      --header "Authorization: Bearer ${CF_API_TOKEN}" \
+      --header 'Content-Type: application/json' \
+      --write-out $'\n%{http_code}' \
+      "${url}")" || fail "Cloudflare API request failed: ${method} ${path}"
+  fi
+
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  printf '%s' "${body}" > "${response_file}"
+
+  if [[ ! "${http_code}" =~ ^[0-9]{3}$ ]]; then
+    fail "Cloudflare API returned invalid HTTP status for ${method} ${path}"
+  fi
+
+  if (( http_code < 200 || http_code >= 300 )); then
+    parsed_errors="$(jq -r '[.errors[]? | ((.code // "unknown") | tostring) + ": " + (.message // "unknown error")] | join("; ")' "${response_file}" 2>/dev/null || true)"
+    if [[ -n "${parsed_errors}" ]]; then
+      fail "Cloudflare API failed: ${method} ${path} HTTP ${http_code}: ${parsed_errors}"
+    fi
+    fail "Cloudflare API failed: ${method} ${path} HTTP ${http_code}"
+  fi
+
+  if ! jq -e '.success == true' "${response_file}" >/dev/null 2>&1; then
+    parsed_errors="$(jq -r '[.errors[]? | ((.code // "unknown") | tostring) + ": " + (.message // "unknown error")] | join("; ")' "${response_file}" 2>/dev/null || true)"
+    if [[ -n "${parsed_errors}" ]]; then
+      fail "Cloudflare API response success=false: ${method} ${path}: ${parsed_errors}"
+    fi
+    fail "Cloudflare API response success=false: ${method} ${path}"
+  fi
+
+  cat "${response_file}"
+}
+
+fetch_paginated() {
+  local resource_path="$1"
+  local output_file="$2"
+  local page=1
+  local total_pages=1
+  local page_file="${workdir}/page.json"
+  local result_file="${workdir}/paginated-result.ndjson"
+
+  : > "${result_file}"
+
+  while (( page <= total_pages )); do
+    cf_api 'GET' "${resource_path}?per_page=100&page=${page}" > "${page_file}"
+    jq -c '.result[]?' "${page_file}" >> "${result_file}"
+
+    total_pages="$(jq -r '.result_info.total_pages // 1' "${page_file}")"
+    if ! is_positive_int "${total_pages}"; then
+      total_pages=1
     fi
 
-    if [[ ! "$http_code" =~ ^2 ]]; then
-        error_text="$(jq -r '[.errors[]?.message] | join("; ")' "$response_file" 2>/dev/null || true)"
-        rm -f "$response_file"
-        [[ -n "$error_text" ]] || error_text="Cloudflare API returned HTTP ${http_code}"
-        fail "$error_text"
-    fi
+    page=$((page + 1))
+  done
 
-    if ! jq -e '.success == true' "$response_file" >/dev/null 2>&1; then
-        error_text="$(jq -r '[.errors[]?.message] | join("; ")' "$response_file" 2>/dev/null || true)"
-        rm -f "$response_file"
-        [[ -n "$error_text" ]] || error_text="Cloudflare API response was not successful"
-        fail "$error_text"
-    fi
+  jq -s '{success:true,result:.}' "${result_file}" > "${output_file}"
+}
 
-    cat "$response_file"
-    rm -f "$response_file"
+build_list_payload() {
+  local list_name="$1"
+  local chunk_file="$2"
+  local output_file="$3"
+  local description="Managed by GitHub Actions. Source: ${BLOCKLIST_URL}"
+
+  jq -Rn \
+    --arg name "${list_name}" \
+    --arg description "${description}" \
+    '{name:$name,description:$description,type:"DOMAIN",items:[inputs | select(length > 0) | {value:.}]}' \
+    < "${chunk_file}" > "${output_file}"
+}
+
+build_rule_payload() {
+  local traffic="$1"
+  local output_file="$2"
+  local description="Managed by GitHub Actions. Source list prefix: ${LIST_PREFIX}"
+
+  jq -n \
+    --arg name "${RULE_NAME}" \
+    --arg description "${description}" \
+    --arg traffic "${traffic}" \
+    --argjson precedence "${RULE_PRECEDENCE}" \
+    '{name:$name,description:$description,action:"block",enabled:true,filters:["dns"],traffic:$traffic,precedence:$precedence}' \
+    > "${output_file}"
 }
 
 normalize_blocklist() {
-    local raw_file="$1"
-    local domains_file="$2"
+  local input_file="$1"
+  local output_file="$2"
 
-    awk '
-    function trim(value) {
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-        return value
-    }
-
-    function valid_domain(domain, parts, total, i) {
-        if (domain !~ /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/) {
-            return 0
-        }
-
-        total = split(domain, parts, ".")
-        for (i = 1; i <= total; i++) {
-            if (length(parts[i]) > 63) {
-                return 0
-            }
-        }
-
-        return 1
-    }
-
+  awk '
     {
-        sub(/\r$/, "", $0)
-        sub(/[[:space:]]+#.*$/, "", $0)
+      line = $0
+      gsub(/\r/, "", line)
+      sub(/#.*/, "", line)
+      sub(/;.*/, "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "") {
+        next
+      }
 
-        domain = trim($0)
+      gsub(/^0\.0\.0\.0[ \t]+/, "", line)
+      gsub(/^127\.0\.0\.1[ \t]+/, "", line)
+      gsub(/^::1[ \t]+/, "", line)
 
-        if (domain == "" || domain ~ /^#/) {
-            next
-        }
+      if (line ~ /^address=\//) {
+        gsub(/^address=\//, "", line)
+        sub(/\/.*/, "", line)
+      }
 
-        sub(/^\|\|/, "", domain)
-        sub(/\^$/, "", domain)
-        sub(/^\*\./, "", domain)
-        sub(/^\.+/, "", domain)
+      if (line ~ /^\|\|/) {
+        gsub(/^\|\|/, "", line)
+        sub(/\^.*/, "", line)
+      }
 
-        domain = tolower(domain)
+      gsub(/^\*\./, "", line)
+      gsub(/^https?:\/\//, "", line)
+      sub(/\/.*$/, "", line)
+      sub(/:.*$/, "", line)
+      gsub(/\.$/, "", line)
+      line = tolower(line)
 
-        if (domain ~ /(^|\.)localhost$/) {
-            next
-        }
-
-        if (valid_domain(domain)) {
-            print domain
-        }
+      if (line ~ /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/) {
+        print line
+      }
     }
-    ' "$raw_file" | sort -u > "$domains_file"
-}
-
-json_items_from_file() {
-    local file="$1"
-
-    jq -R -s '
-        split("\n")
-        | map(select(length > 0))
-        | map({value: .})
-    ' "$file"
-}
-
-get_existing_list_id() {
-    local current_lists="$1"
-    local list_name="$2"
-
-    jq -r --arg name "$list_name" '
-        .result[]?
-        | select(.name == $name)
-        | .id
-    ' <<< "$current_lists" | head -n 1
-}
-
-build_traffic_expression() {
-    local expression=""
-    local list_id
-    local condition
-
-    for list_id in "$@"; do
-        condition="(any(dns.domains[*] in \$$list_id) or dns.fqdn in \$$list_id)"
-
-        if [[ -z "$expression" ]]; then
-            expression="$condition"
-        else
-            expression="${expression} or ${condition}"
-        fi
-    done
-
-    printf '%s\n' "$expression"
+  ' "${input_file}" | sort -u > "${output_file}"
 }
 
 main() {
-    require_cmd curl
-    require_cmd jq
-    require_cmd awk
-    require_cmd sort
-    require_cmd split
-    require_cmd find
-    require_cmd wc
+  require_cmd curl
+  require_cmd jq
+  require_cmd awk
+  require_cmd sort
+  require_cmd split
+  require_cmd wc
+  require_cmd tr
+  require_cmd grep
+  require_cmd sed
+  require_cmd mktemp
 
-    validate_config
+  require_env CF_API_TOKEN
+  require_env CF_ACCOUNT_ID
 
-    local workdir
-    local raw_file
-    local domains_file
-    local total_domains
-    local total_chunks
-    local current_lists
-    local current_rules
-    local existing_total_count
-    local existing_managed_count
-    local existing_non_managed_count
-    local list_budget_needed
-    local chunk_files
-    local used_list_ids
-    local chunk_file
-    local index
-    local list_number
-    local list_name
-    local list_description
-    local existing_list_id
-    local items_json
-    local payload
-    local response
-    local created_list_id
-    local traffic
-    local rule_id
-    local rule_payload
-    local managed_prefix
-    local expression_length
+  CF_API_BASE="${CF_API_BASE:-https://api.cloudflare.com/client/v4}"
+  LIST_PREFIX="${LIST_PREFIX:-Block ads}"
+  RULE_NAME="${RULE_NAME:-Block ads}"
+  BLOCKLIST_URL="${BLOCKLIST_URL:-https://small.oisd.nl/domainswild2}"
+  MAX_LIST_SIZE="${MAX_LIST_SIZE:-1000}"
+  MAX_LISTS="${MAX_LISTS:-100}"
+  CLOUDFLARE_LIST_LIMIT="${CLOUDFLARE_LIST_LIMIT:-1000}"
+  RULE_PRECEDENCE="${RULE_PRECEDENCE:-90}"
+  DELETE_EXCESS_LISTS="${DELETE_EXCESS_LISTS:-0}"
+  CF_API_SLEEP_SECONDS="${CF_API_SLEEP_SECONDS:-0.15}"
 
-    workdir="$(mktemp -d)"
-    raw_file="${workdir}/blocklist.raw.txt"
-    domains_file="${workdir}/domains.normalized.txt"
-    managed_prefix="${LIST_PREFIX} - "
-    used_list_ids=()
+  if [[ ! "${CF_ACCOUNT_ID}" =~ ^[a-fA-F0-9]{32}$ ]]; then
+    fail 'CF_ACCOUNT_ID must be a 32-character Cloudflare account ID.'
+  fi
 
-    trap 'rm -rf "$workdir"' EXIT
+  if ! is_positive_int "${MAX_LIST_SIZE}"; then
+    fail 'MAX_LIST_SIZE must be a positive integer.'
+  fi
 
-    info "Downloading blocklist"
-    curl -fsSL \
-        --retry 5 \
-        --retry-delay 2 \
-        --retry-all-errors \
-        "$BLOCKLIST_URL" \
-        -o "$raw_file"
+  if ! is_positive_int "${MAX_LISTS}"; then
+    fail 'MAX_LISTS must be a positive integer.'
+  fi
 
-    info "Normalizing blocklist"
-    normalize_blocklist "$raw_file" "$domains_file"
+  if ! is_positive_int "${CLOUDFLARE_LIST_LIMIT}"; then
+    fail 'CLOUDFLARE_LIST_LIMIT must be a positive integer.'
+  fi
 
-    total_domains="$(wc -l < "$domains_file" | tr -d '[:space:]')"
-    (( total_domains > 0 )) || fail "Normalized blocklist is empty"
+  if ! is_non_negative_int "${RULE_PRECEDENCE}"; then
+    fail 'RULE_PRECEDENCE must be a non-negative integer.'
+  fi
 
-    total_chunks=$(( (total_domains + MAX_LIST_SIZE - 1) / MAX_LIST_SIZE ))
+  if [[ "${DELETE_EXCESS_LISTS}" != '0' && "${DELETE_EXCESS_LISTS}" != '1' ]]; then
+    fail 'DELETE_EXCESS_LISTS must be 0 or 1.'
+  fi
 
-    (( total_chunks <= MAX_LISTS )) || fail "Need ${total_chunks} lists, but MAX_LISTS is ${MAX_LISTS}"
+  if (( MAX_LIST_SIZE > CLOUDFLARE_LIST_LIMIT )); then
+    fail 'MAX_LIST_SIZE must not be greater than CLOUDFLARE_LIST_LIMIT.'
+  fi
 
-    info "Domains: ${total_domains}"
-    info "Required Cloudflare lists: ${total_chunks}"
+  workdir="$(mktemp -d)"
+  local raw_file="${workdir}/blocklist.raw"
+  local domains_file="${workdir}/domains.txt"
+  local chunks_dir="${workdir}/chunks"
+  local existing_lists_file="${workdir}/existing-lists.json"
+  local existing_rules_file="${workdir}/existing-rules.json"
+  local active_ids_file="${workdir}/active-list-ids.txt"
+  local required_names_file="${workdir}/required-list-names.txt"
+  local domain_count='0'
+  local required_lists='0'
+  local idx='0'
+  local traffic=''
+  local rule_id=''
+  local rule_payload="${workdir}/rule-payload.json"
+  local rule_response="${workdir}/rule-response.json"
 
-    info "Fetching existing Cloudflare Gateway lists"
-    current_lists="$(api_request "GET" "/accounts/${CF_ACCOUNT_ID}/gateway/lists?per_page=1000")"
+  mkdir -p "${chunks_dir}"
+  : > "${active_ids_file}"
+  : > "${required_names_file}"
 
-    existing_total_count="$(jq -r '.result | length' <<< "$current_lists")"
-    existing_managed_count="$(
-        jq -r --arg prefix "$managed_prefix" '
-            [.result[]? | select(.name | startswith($prefix))] | length
-        ' <<< "$current_lists"
-    )"
+  log 'Downloading blocklist'
+  curl -fsSL \
+    --connect-timeout 20 \
+    --max-time 180 \
+    --retry 3 \
+    --retry-delay 2 \
+    --retry-all-errors \
+    "${BLOCKLIST_URL}" \
+    -o "${raw_file}"
 
-    existing_non_managed_count=$(( existing_total_count - existing_managed_count ))
-    list_budget_needed=$(( existing_non_managed_count + total_chunks ))
+  log 'Normalizing blocklist'
+  normalize_blocklist "${raw_file}" "${domains_file}"
 
-    if (( list_budget_needed > CLOUDFLARE_LIST_LIMIT )); then
-        fail "Cloudflare list limit exceeded. Existing non-managed lists: ${existing_non_managed_count}, needed managed lists: ${total_chunks}, limit: ${CLOUDFLARE_LIST_LIMIT}"
-    fi
+  domain_count="$(wc -l < "${domains_file}" | tr -d '[:space:]')"
+  if [[ -z "${domain_count}" ]]; then
+    domain_count='0'
+  fi
 
-    split -d -a 3 -l "$MAX_LIST_SIZE" "$domains_file" "${workdir}/chunk-"
-    mapfile -t chunk_files < <(find "$workdir" -maxdepth 1 -type f -name 'chunk-*' | sort)
+  if (( domain_count < 1 )); then
+    fail 'Normalized blocklist is empty.'
+  fi
 
-    for index in "${!chunk_files[@]}"; do
-        chunk_file="${chunk_files[$index]}"
-        list_number=$(( index + 1 ))
-        list_name="${LIST_PREFIX} - $(printf '%03d' "$list_number")"
-        list_description="Managed by cf-gateway-ads-sync.sh. Source blocklist is normalized before upload."
+  required_lists=$(( (domain_count + MAX_LIST_SIZE - 1) / MAX_LIST_SIZE ))
 
-        existing_list_id="$(get_existing_list_id "$current_lists" "$list_name")"
-        items_json="$(json_items_from_file "$chunk_file")"
+  if (( required_lists > MAX_LISTS )); then
+    fail "Required Cloudflare lists (${required_lists}) exceed MAX_LISTS (${MAX_LISTS}). Increase MAX_LISTS or reduce MAX_LIST_SIZE/source list."
+  fi
 
-        if [[ -n "$existing_list_id" && "$existing_list_id" != "null" ]]; then
-            info "Updating list: ${list_name}"
+  log "Domains: ${domain_count}"
+  log "Required Cloudflare lists: ${required_lists}"
 
-            payload="$(
-                jq -n \
-                    --arg name "$list_name" \
-                    --arg description "$list_description" \
-                    --argjson items "$items_json" \
-                    '{
-                        name: $name,
-                        description: $description,
-                        items: $items
-                    }'
-            )"
+  split -l "${MAX_LIST_SIZE}" -d -a 3 "${domains_file}" "${chunks_dir}/chunk-"
 
-            response="$(api_request "PUT" "/accounts/${CF_ACCOUNT_ID}/gateway/lists/${existing_list_id}" "$payload")"
-            created_list_id="$(jq -r '.result.id // empty' <<< "$response")"
-            [[ -n "$created_list_id" ]] || created_list_id="$existing_list_id"
-            used_list_ids+=("$created_list_id")
-        else
-            info "Creating list: ${list_name}"
+  log 'Fetching existing Cloudflare Gateway lists'
+  fetch_paginated "/accounts/${CF_ACCOUNT_ID}/gateway/lists" "${existing_lists_file}"
 
-            payload="$(
-                jq -n \
-                    --arg name "$list_name" \
-                    --arg description "$list_description" \
-                    --argjson items "$items_json" \
-                    '{
-                        name: $name,
-                        description: $description,
-                        type: "DOMAIN",
-                        items: $items
-                    }'
-            )"
+  idx=0
+  while IFS= read -r chunk_file; do
+    idx=$((idx + 1))
 
-            response="$(api_request "POST" "/accounts/${CF_ACCOUNT_ID}/gateway/lists" "$payload")"
-            created_list_id="$(jq -r '.result.id // empty' <<< "$response")"
-            [[ -n "$created_list_id" ]] || fail "Cloudflare did not return a list ID for ${list_name}"
-            used_list_ids+=("$created_list_id")
-        fi
-    done
+    local list_name=''
+    local list_id=''
+    local payload_file=''
+    local list_response=''
 
-    if [[ "$DELETE_EXCESS_LISTS" == "1" ]]; then
-        while IFS=$'\t' read -r list_name existing_list_id; do
-            [[ -n "$list_name" && -n "$existing_list_id" ]] || continue
+    list_name="$(printf '%s - %03d' "${LIST_PREFIX}" "${idx}")"
+    payload_file="${workdir}/list-${idx}.json"
+    printf '%s\n' "${list_name}" >> "${required_names_file}"
 
-            local suffix
-            local numeric_suffix
+    build_list_payload "${list_name}" "${chunk_file}" "${payload_file}"
 
-            suffix="${list_name#${managed_prefix}}"
+    list_id="$(jq -r --arg name "${list_name}" 'first(.result[]? | select(.name == $name) | .id) // empty' "${existing_lists_file}")"
 
-            if [[ "$suffix" =~ ^[0-9]{3}$ ]]; then
-                numeric_suffix=$((10#$suffix))
-
-                if (( numeric_suffix > total_chunks )); then
-                    info "Deleting excess list: ${list_name}"
-                    api_request "DELETE" "/accounts/${CF_ACCOUNT_ID}/gateway/lists/${existing_list_id}" >/dev/null
-                fi
-            fi
-        done < <(
-            jq -r --arg prefix "$managed_prefix" '
-                .result[]?
-                | select(.name | startswith($prefix))
-                | [.name, .id]
-                | @tsv
-            ' <<< "$current_lists"
-        )
-    fi
-
-    traffic="$(build_traffic_expression "${used_list_ids[@]}")"
-    expression_length="${#traffic}"
-
-    (( expression_length > 0 )) || fail "Traffic expression is empty"
-    (( expression_length < 140000 )) || fail "Traffic expression is too long: ${expression_length} characters"
-
-    info "Fetching existing Cloudflare Gateway rules"
-    current_rules="$(api_request "GET" "/accounts/${CF_ACCOUNT_ID}/gateway/rules?per_page=1000")"
-
-    rule_id="$(
-        jq -r --arg name "$RULE_NAME" '
-            .result[]?
-            | select(.name == $name)
-            | .id
-        ' <<< "$current_rules" | head -n 1
-    )"
-
-    rule_payload="$(
-        jq -n \
-            --arg name "$RULE_NAME" \
-            --arg description "Managed by cf-gateway-ads-sync.sh. Blocks domains from managed Cloudflare Gateway lists." \
-            --arg traffic "$traffic" \
-            --argjson precedence "$RULE_PRECEDENCE" \
-            '{
-                name: $name,
-                description: $description,
-                precedence: $precedence,
-                enabled: true,
-                action: "block",
-                filters: ["dns"],
-                traffic: $traffic,
-                identity: ""
-            }'
-    )"
-
-    if [[ -n "$rule_id" && "$rule_id" != "null" ]]; then
-        info "Updating DNS Gateway rule: ${RULE_NAME}"
-        api_request "PUT" "/accounts/${CF_ACCOUNT_ID}/gateway/rules/${rule_id}" "$rule_payload" >/dev/null
+    if [[ -n "${list_id}" ]]; then
+      log "Updating list: ${list_name}"
+      list_response="$(cf_api 'PUT' "/accounts/${CF_ACCOUNT_ID}/gateway/lists/${list_id}" "${payload_file}")"
+      printf '%s' "${list_response}" > "${workdir}/list-${idx}-response.json"
     else
-        info "Creating DNS Gateway rule: ${RULE_NAME}"
-        api_request "POST" "/accounts/${CF_ACCOUNT_ID}/gateway/rules" "$rule_payload" >/dev/null
+      log "Creating list: ${list_name}"
+      list_response="$(cf_api 'POST' "/accounts/${CF_ACCOUNT_ID}/gateway/lists" "${payload_file}")"
+      printf '%s' "${list_response}" > "${workdir}/list-${idx}-response.json"
+      list_id="$(jq -r '.result.id // empty' "${workdir}/list-${idx}-response.json")"
     fi
 
-    info "Done"
+    if [[ -z "${list_id}" ]]; then
+      fail "Unable to resolve Cloudflare list ID for ${list_name}."
+    fi
+
+    printf '%s\n' "${list_id}" >> "${active_ids_file}"
+    sleep "${CF_API_SLEEP_SECONDS}"
+  done < <(find "${chunks_dir}" -type f -name 'chunk-*' | sort)
+
+  traffic="$(jq -R -s -r 'split("\n") | map(select(length > 0)) | map("dns.fqdn in $" + .) | join(" or ")' "${active_ids_file}")"
+
+  if [[ -z "${traffic}" ]]; then
+    fail 'Generated Gateway rule traffic expression is empty.'
+  fi
+
+  log 'Fetching existing Cloudflare Gateway rules'
+  fetch_paginated "/accounts/${CF_ACCOUNT_ID}/gateway/rules" "${existing_rules_file}"
+
+  rule_id="$(jq -r --arg name "${RULE_NAME}" 'first(.result[]? | select(.name == $name and ((.filters // []) | index("dns"))) | .id) // empty' "${existing_rules_file}")"
+
+  build_rule_payload "${traffic}" "${rule_payload}"
+
+  if [[ -n "${rule_id}" ]]; then
+    log "Updating DNS Gateway rule: ${RULE_NAME}"
+    cf_api 'PUT' "/accounts/${CF_ACCOUNT_ID}/gateway/rules/${rule_id}" "${rule_payload}" > "${rule_response}"
+  else
+    log "Creating DNS Gateway rule: ${RULE_NAME}"
+    cf_api 'POST' "/accounts/${CF_ACCOUNT_ID}/gateway/rules" "${rule_payload}" > "${rule_response}"
+  fi
+
+  if [[ "${DELETE_EXCESS_LISTS}" == '1' ]]; then
+    log 'Deleting excess Cloudflare Gateway lists'
+
+    while IFS=$'\t' read -r list_id list_name; do
+      if [[ -z "${list_id}" || -z "${list_name}" ]]; then
+        continue
+      fi
+
+      if grep -Fxq -- "${list_name}" "${required_names_file}"; then
+        continue
+      fi
+
+      log "Deleting excess list: ${list_name}"
+      cf_api 'DELETE' "/accounts/${CF_ACCOUNT_ID}/gateway/lists/${list_id}" > /dev/null
+      sleep "${CF_API_SLEEP_SECONDS}"
+    done < <(jq -r --arg prefix "${LIST_PREFIX} - " '.result[]? | select(.name | startswith($prefix)) | [.id, .name] | @tsv' "${existing_lists_file}")
+  else
+    warn 'DELETE_EXCESS_LISTS is disabled; old managed lists will be kept.'
+  fi
+
+  log 'Done'
 }
 
 main "$@"
