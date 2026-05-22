@@ -22,18 +22,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Validate script syntax
-        run: bash -n ./cf-gateway-ads-sync.sh
-
-      - name: Sync blocklist to Cloudflare Gateway
+      - name: Validate required secrets
+        shell: bash
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
 
+          if [ -z "${CF_API_TOKEN}" ]; then
+            echo "::error::Missing GitHub Secret: CF_API_TOKEN"
+            exit 1
+          fi
+
+          if [ -z "${CF_ACCOUNT_ID}" ]; then
+            echo "::error::Missing GitHub Secret: CF_ACCOUNT_ID"
+            exit 1
+          fi
+
+      - name: Validate script syntax
+        shell: bash
+        run: bash -n ./cf-gateway-ads-sync.sh
+
+      - name: Sync blocklist to Cloudflare Gateway
+        shell: bash
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           LIST_PREFIX: "Block ads"
           RULE_NAME: "Block ads"
           BLOCKLIST_URL: "https://small.oisd.nl/domainswild2"
-
           MAX_LIST_SIZE: "1000"
           MAX_LISTS: "100"
           CLOUDFLARE_LIST_LIMIT: "100"
