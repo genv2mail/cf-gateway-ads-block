@@ -1,0 +1,42 @@
+name: Cloudflare Gateway Ad Block Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cf-gateway-ad-block-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync Cloudflare Gateway blocklist
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate script syntax
+        run: bash -n ./cf-gateway-ads-sync.sh
+
+      - name: Sync blocklist to Cloudflare Gateway
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+          LIST_PREFIX: "Block ads"
+          RULE_NAME: "Block ads"
+          BLOCKLIST_URL: "https://small.oisd.nl/domainswild2"
+
+          MAX_LIST_SIZE: "1000"
+          MAX_LISTS: "100"
+          CLOUDFLARE_LIST_LIMIT: "100"
+          RULE_PRECEDENCE: "90"
+          DELETE_EXCESS_LISTS: "1"
+        run: bash ./cf-gateway-ads-sync.sh
